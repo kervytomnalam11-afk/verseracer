@@ -2,9 +2,14 @@
 VerseRacer - UI Screens and Widgets (Kivy)
 Made by KERVY NALAM
 
-FIXES:
+FIXES APPLIED:
+  - Window.softinput_mode = 'below_target' so Android soft keyboard pans view
+    instead of covering the game UI
+  - Window.keyboard_anim_args set for smooth keyboard animation
   - Layout anchored to top with pos_hint so verse/car stay visible when keyboard appears
-  - Verse input cleared with Clock.schedule_once to fix re-entrancy on every verse (not just first)
+  - dp(4) buffer added to keyboard_height callbacks to prevent bottom clipping
+  - _keyboard_binding unbound in _show_results() (not only _go_menu()) to prevent leaks
+  - Verse input cleared with Clock.schedule_once to fix re-entrancy on every verse
   - SoundManager now lazy-loads so app.directory is available at load time
   - All /root/ paths removed (GitHub Actions runner is not root)
 """
@@ -225,8 +230,15 @@ class CountdownOverlay(FloatLayout):
                           color=YELLOW, pos_hint={'center_x': 0.5, 'center_y': 0.55})
         self.sub = Label(text="Get ready…", font_size=sp(18),
                           color=TEXT_COLOR, pos_hint={'center_x': 0.5, 'center_y': 0.42})
+        # Made by label on countdown overlay
+        self.credits = Label(
+            text="Made by KERVY NALAM",
+            font_size=sp(10),
+            color=(0.5, 0.5, 0.6, 0.8),
+            pos_hint={'center_x': 0.5, 'center_y': 0.12})
         self.add_widget(self.lbl)
         self.add_widget(self.sub)
+        self.add_widget(self.credits)
 
         Clock.schedule_interval(self._tick, 1.0)
 
@@ -271,8 +283,9 @@ class MenuScreen(Screen):
             size_hint_y=None, height=dp(22)))
         inner.add_widget(Label(
             text="Made by KERVY NALAM",
-            font_size=sp(10), color=(0.6, 0.6, 0.7, 1),
-            size_hint_y=None, height=dp(18)))
+            font_size=sp(11), color=HIGHLIGHT,
+            bold=True,
+            size_hint_y=None, height=dp(20)))
         inner.add_widget(Widget(size_hint_y=None, height=dp(8)))
 
         modes = [
@@ -391,6 +404,11 @@ class AISetupScreen(Screen):
         back.background_color = ACCENT_COLOR
         back.bind(on_release=lambda *_: setattr(self.manager, 'current', 'menu'))
         layout.add_widget(back)
+
+        layout.add_widget(Label(
+            text="Made by KERVY NALAM",
+            font_size=sp(10), color=(0.5, 0.5, 0.65, 1),
+            size_hint_y=None, height=dp(18)))
 
         self.add_widget(layout)
 
@@ -514,20 +532,21 @@ class GameScreen(Screen):
         root = FloatLayout()
         _make_bg(root, BG_COLOR)
 
-        # ── FIX: pos_hint anchors layout to TOP of screen so that when the
-        #    keyboard appears and layout.height shrinks, content stays at the
-        #    top (verse + car visible) instead of sinking to the bottom.
+        # FIX: pos_hint anchors layout to TOP of screen so that when the
+        # keyboard appears and layout.height shrinks, content stays at the
+        # top (verse + car visible) instead of sinking to the bottom.
         layout = BoxLayout(
             orientation='vertical',
             padding=dp(10),
             spacing=dp(6),
             size_hint=(1, None),
-            pos_hint={'x': 0, 'top': 1},   # ← anchored to top
+            pos_hint={'x': 0, 'top': 1},   # anchored to top
         )
-        layout.height = Window.height - Window.keyboard_height
+        # FIX: dp(4) buffer prevents bottom button from being clipped
+        layout.height = Window.height - Window.keyboard_height - dp(4)
 
         def _on_keyboard_height(window, height):
-            layout.height = window.height - height
+            layout.height = window.height - height - dp(4)
 
         Window.bind(keyboard_height=_on_keyboard_height)
         self._keyboard_binding = _on_keyboard_height
@@ -544,6 +563,16 @@ class GameScreen(Screen):
                   self.time_label, self.verse_count_label):
             stats.add_widget(w)
         layout.add_widget(stats)
+
+        # Made by label — compact, inside game UI
+        layout.add_widget(Label(
+            text="Made by KERVY NALAM",
+            font_size=sp(9),
+            color=(0.45, 0.45, 0.6, 0.85),
+            size_hint_y=None,
+            height=dp(14),
+            halign='right',
+            text_size=(Window.width - dp(24), None)))
 
         # Bible verse reference label
         ref = get_reference(self.game.current_verse)
@@ -588,7 +617,6 @@ class GameScreen(Screen):
 
         # ── Race track area ───────────────────────
         if self.ai_opponents:
-            app = App.get_running_app()
             n_racers = 1 + len(self.ai_opponents)
             track_h = dp(38) * n_racers
             self.multi_track = MultiTrackWidget(size_hint_y=None, height=track_h)
@@ -646,14 +674,11 @@ class GameScreen(Screen):
 
         # Hard-mode backspace rejection
         if result is not None and result != value:
-            # Schedule to avoid re-entrancy
             Clock.schedule_once(lambda dt: setattr(self.text_input, 'text', result), 0)
             return
 
-        # ── FIX: verse completed → always clear input on next frame ──────────
-        # Using Clock.schedule_once avoids the re-entrancy problem where
-        # setting text="" inside on_text fires on_text again immediately,
-        # which could confuse the game state on Android soft keyboards.
+        # FIX: verse completed → always clear input on next frame via
+        # Clock.schedule_once to avoid re-entrancy on Android soft keyboards.
         verse_changed      = self.game.current_verse_index != verse_before
         game_just_finished = self.game.is_finished and value != ""
 
@@ -668,7 +693,7 @@ class GameScreen(Screen):
             Clock.schedule_once(lambda dt: self._show_results(), 0.1)
 
     def _clear_input(self):
-        """Clear the text input and refresh verse display. Always called via schedule_once."""
+        """Clear the text input and refresh verse display."""
         self.text_input.text = ""
         self._update_verse_display()
 
@@ -739,12 +764,21 @@ class GameScreen(Screen):
             self.game.finish()
             self._show_results()
 
+    def _unbind_keyboard(self):
+        """Unbind keyboard height listener and clean up."""
+        if self._keyboard_binding:
+            Window.unbind(keyboard_height=self._keyboard_binding)
+            self._keyboard_binding = None
+
     def _show_results(self):
         if self._event:
             self._event.cancel()
             self._event = None
         sfx.stop_music()
         sfx.play("fanfare")
+
+        # FIX: unbind keyboard here too, not only in _go_menu()
+        self._unbind_keyboard()
 
         app      = App.get_running_app()
         wpm      = self.game.get_wpm()
@@ -773,9 +807,7 @@ class GameScreen(Screen):
         if self._event:
             self._event.cancel()
             self._event = None
-        if self._keyboard_binding:
-            Window.unbind(keyboard_height=self._keyboard_binding)
-            self._keyboard_binding = None
+        self._unbind_keyboard()
         self.manager.current = "menu"
 
 
@@ -812,18 +844,19 @@ class MPGameScreen(Screen):
         root = FloatLayout()
         _make_bg(root, BG_COLOR)
 
-        # ── FIX: anchor to top so content stays above keyboard ────────────────
+        # FIX: anchor to top so content stays above keyboard
         outer = BoxLayout(
             orientation='vertical',
             padding=dp(4),
             spacing=dp(4),
             size_hint=(1, None),
-            pos_hint={'x': 0, 'top': 1},   # ← anchored to top
+            pos_hint={'x': 0, 'top': 1},   # anchored to top
         )
-        outer.height = Window.height - Window.keyboard_height
+        # FIX: dp(4) buffer prevents bottom button from being clipped
+        outer.height = Window.height - Window.keyboard_height - dp(4)
 
         def _mp_keyboard_height(window, height):
-            outer.height = window.height - height
+            outer.height = window.height - height - dp(4)
 
         Window.bind(keyboard_height=_mp_keyboard_height)
         self._keyboard_binding = _mp_keyboard_height
@@ -847,6 +880,16 @@ class MPGameScreen(Screen):
             container.add_widget(section)
 
         outer.add_widget(container)
+
+        # Made by label in multiplayer
+        outer.add_widget(Label(
+            text="Made by KERVY NALAM",
+            font_size=sp(9),
+            color=(0.45, 0.45, 0.6, 0.8),
+            size_hint_y=None,
+            height=dp(14),
+            halign='center',
+            text_size=(Window.width, None)))
 
         menu_btn = StyledButton(text="← Menu", height=dp(38))
         menu_btn.size_hint_y = None
@@ -948,9 +991,9 @@ class MPGameScreen(Screen):
         player.chars_typed           = game.total_distance + len(game.typed_text)
         player.correct_chars         = game.total_distance + game.correct_count
 
-        # ── FIX: always clear on verse completion via schedule_once ──────────
+        # FIX: always clear on verse completion via schedule_once
         if game.current_verse_index != verse_before:
-            idx = player_idx   # capture for lambda
+            idx = player_idx
             Clock.schedule_once(lambda dt: self._clear_mp_input(idx), 0)
 
         self._refresh_verse_label(player_idx, game)
@@ -1006,12 +1049,21 @@ class MPGameScreen(Screen):
             if player.finished:
                 self.stat_labels[i].text += f"  🏁 #{player.place}"
 
+    def _unbind_keyboard(self):
+        """Unbind keyboard height listener and clean up."""
+        if self._keyboard_binding:
+            Window.unbind(keyboard_height=self._keyboard_binding)
+            self._keyboard_binding = None
+
     def _show_results(self):
         if self._event:
             self._event.cancel()
             self._event = None
         sfx.stop_music()
         sfx.play("fanfare")
+
+        # FIX: unbind keyboard here too, not only in _go_menu()
+        self._unbind_keyboard()
 
         now = time.time()
         participants = []
@@ -1036,9 +1088,7 @@ class MPGameScreen(Screen):
         if self._event:
             self._event.cancel()
             self._event = None
-        if self._keyboard_binding:
-            Window.unbind(keyboard_height=self._keyboard_binding)
-            self._keyboard_binding = None
+        self._unbind_keyboard()
         self.manager.current = "menu"
 
 
@@ -1115,9 +1165,13 @@ class ResultsScreen(Screen):
         snd_btn.bind(on_release=lambda *_: sfx.toggle())
         inner.add_widget(snd_btn)
 
-        inner.add_widget(Label(text="Made by KERVY NALAM", font_size=sp(9),
-                                color=(0.45, 0.45, 0.55, 1),
-                                size_hint_y=None, height=dp(16)))
+        inner.add_widget(Label(
+            text="🏎️ VerseRacer  —  Made by KERVY NALAM",
+            font_size=sp(10), bold=True,
+            color=HIGHLIGHT,
+            size_hint_y=None, height=dp(20),
+            halign='center',
+            text_size=(Window.width - dp(40), None)))
 
         self.add_widget(_scrolled(inner))
 
@@ -1171,6 +1225,12 @@ class LeaderboardScreen(Screen):
         self.entries_layout.bind(minimum_height=self.entries_layout.setter('height'))
         layout.add_widget(_scrolled(self.entries_layout))
 
+        layout.add_widget(Label(
+            text="Made by KERVY NALAM",
+            font_size=sp(10), color=(0.5, 0.5, 0.65, 1),
+            size_hint_y=None, height=dp(18),
+            halign='center', text_size=(Window.width - dp(28), None)))
+
         back = StyledButton(text="← Back")
         back.background_color = ACCENT_COLOR
         back.bind(on_release=lambda *_: setattr(self.manager, 'current', 'menu'))
@@ -1207,6 +1267,13 @@ class LeaderboardScreen(Screen):
 # ─────────────────────────────────────────────
 
 def build_app():
+    # ── FIX: tell Kivy how to handle the Android soft keyboard ──────────────
+    # 'below_target' pans the window up so the focused TextInput stays visible
+    # above the keyboard instead of being hidden behind it.
+    # Without this, layouts get covered regardless of pos_hint anchoring.
+    Window.softinput_mode = 'below_target'
+    Window.keyboard_anim_args = {'d': .2, 't': 'in_out_expo'}
+
     sm = ScreenManager(transition=SlideTransition())
     sm.add_widget(MenuScreen(name="menu"))
     sm.add_widget(AISetupScreen(name="ai_setup"))
