@@ -13,16 +13,25 @@ package.domain = com.kervynalam
 source.dir = .
 
 # Source files to include
-source.include_exts = py,png,jpg,wav,ogg,mp3,json,kv,ttf
-source.include_patterns = assets/*
+# All relevant extensions — py, kivy, images, audio, fonts, data
+source.include_exts = py,png,jpg,jpeg,gif,wav,ogg,mp3,json,kv,ttf,otf,atlas,xml
+
+# FIX 1: Use ** to recursively include ALL subfolders inside assets/
+# Without **, only the top-level assets/ files are bundled — subfolders are skipped.
+source.include_patterns = assets/**,assets/**/*
 
 # Application version
 version = 1.0.0
 
-# Python requirements — note: kivy includes SDL2, etc.
-requirements = python3,kivy==2.3.0
+# FIX 2: Add kivy_deps and kivy_garden for audio/video support.
+# kivy==2.3.0 needs sdl2, sdl2_mixer for sound to work on Android.
+# Also add kivy_deps.sdl2 if you use Kivy's SoundLoader.
+# ── ADD any extra libraries your game uses after the comma, e.g.:
+#    ...,requests,  (if you fetch data from the internet)
+#    ...,kivymd,    (if you use Material Design widgets)
+requirements = python3,kivy==2.3.0,sdl2,sdl2_ttf,sdl2_mixer,sdl2_image
 
-# Orientation: portrait (or landscape for 3-4 player mode hint)
+# Orientation
 orientation = portrait
 
 # Android-specific
@@ -32,7 +41,8 @@ android.minapi = 21
 android.ndk = 25b
 android.archs = arm64-v8a
 
-# Icon and presplash (place files in assets/)
+# FIX 3: Uncomment and set these if you have icon/presplash in assets/
+# Recommended: icon should be 512x512 PNG, presplash 1080x1920 PNG
 #icon.filename = %(source.dir)s/assets/icon.png
 #presplash.filename = %(source.dir)s/assets/presplash.png
 
