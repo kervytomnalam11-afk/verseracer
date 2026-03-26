@@ -10,13 +10,14 @@ on:
 
 # ─── Global timeout: kill the job if it hangs (e.g. stuck download) ──────────
 # First build ~45 min (cold cache), subsequent ~10 min (warm cache)
-timeout-minutes: 60
+
 
 jobs:
   build:
     name: Build Android APK
     runs-on: ubuntu-22.04     # 22.04 required — 24.04 breaks several p4a recipes
-
+    timeout-minutes: 60
+    
     env:
       # Silence buildozer's "running as root" warning (GitHub runners are root)
       BUILDOZER_WARN_ON_ROOT: "0"
