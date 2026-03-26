@@ -6,17 +6,29 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-  workflow_dispatch:          # Manual trigger from the Actions tab
+  workflow_dispatch:
 
 jobs:
   build:
     name: Build Android APK
-    runs-on: ubuntu-22.04     # 22.04 required — 24.04 breaks several p4a recipes
-    timeout-minutes: 60       # First build ~45 min (cold cache), subsequent ~10 min (warm cache)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
 
     env:
-      BUILDOZER_WARN_ON_ROOT: "0"
+      # ── FIX 1: Both ANDROID_HOME and ANDROID_SDK_ROOT must be set ────────────
+      # Some SDK tools (sdkmanager, aapt2, gradle plugin) read one or the other.
+      # Setting both avoids "SDK location not found" errors.
       ANDROID_HOME: /home/runner/.buildozer/android/platform/android-sdk
+      ANDROID_SDK_ROOT: /home/runner/.buildozer/android/platform/android-sdk
+
+      # ── FIX 2: Explicit JAVA_HOME ─────────────────────────────────────────────
+      # Gradle and p4a can fail to locate Java if JAVA_HOME is not set explicitly.
+      JAVA_HOME: /usr/lib/jvm/temurin-17-jdk-amd64
+
+      # ── FIX 3: Gradle user home inside runner home, not /root ─────────────────
+      GRADLE_USER_HOME: /home/runner/.gradle
+
+      BUILDOZER_WARN_ON_ROOT: "0"
       USE_CCACHE: "1"
       CCACHE_DIR: /home/runner/.ccache
 
@@ -58,37 +70,45 @@ jobs:
             libc++-dev \
             libstdc++-12-dev \
             ccache \
-            python3-dev
+            python3-dev \
+            openjdk-17-jdk
 
       # ── 5. Python packages ───────────────────────────────────────────────────
+      # ── FIX 4: Do NOT pip-install python-for-android separately ──────────────
+      # buildozer 1.5.0 always clones p4a from GitHub into .buildozer/,
+      # completely ignoring the pip-installed version. Having both causes
+      # version mismatches. Let buildozer manage p4a on its own.
       - name: Install buildozer and dependencies
         run: |
           pip install --upgrade pip wheel
           pip install \
             "sh>=1.14.2,<2.0.0" \
             "Cython==0.29.37" \
-            "buildozer==1.5.0" \
-            "python-for-android==2023.9.16"
+            "buildozer==1.5.0"
 
-      # ── 6. Cache: Android SDK + NDK ──────────────────────────────────────────
+      # ── 6. Cache: Android SDK + NDK + cmdline-tools ──────────────────────────
+      # ── FIX 5: Cache key updated to include cmdline-tools (v2) ───────────────
       - name: Cache Android SDK and NDK
         uses: actions/cache@v4
         with:
           path: ~/.buildozer/android/platform
-          key: android-sdk-ndk-api33-ndk25b-v1
+          key: android-sdk-ndk-api33-ndk25b-cmdtools-v2
           restore-keys: |
+            android-sdk-ndk-api33-ndk25b-cmdtools-
             android-sdk-ndk-api33-ndk25b-
 
-      # ── 7. Cache: p4a build artefacts (compiled recipes) ─────────────────────
+      # ── 7. Cache: p4a build artefacts ────────────────────────────────────────
+      # ── FIX 6: requirements.txt may not exist — fallback to 'no-req' ──────────
       - name: Cache python-for-android build
         uses: actions/cache@v4
         with:
           path: ~/.buildozer/android/app
-          key: ${{ runner.os }}-p4a-${{ hashFiles('buildozer.spec', 'requirements.txt') }}
+          key: ${{ runner.os }}-p4a-${{ hashFiles('buildozer.spec') }}-${{ hashFiles('requirements.txt') || 'no-req' }}
           restore-keys: |
+            ${{ runner.os }}-p4a-${{ hashFiles('buildozer.spec') }}-
             ${{ runner.os }}-p4a-
 
-      # ── 8. Cache: ccache (C/C++ object cache) ────────────────────────────────
+      # ── 8. Cache: ccache ─────────────────────────────────────────────────────
       - name: Cache ccache
         uses: actions/cache@v4
         with:
@@ -97,7 +117,41 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-ccache-
 
-      # ── 9. Accept Android SDK licenses ───────────────────────────────────────
+      # ── 9. Cache: Gradle ─────────────────────────────────────────────────────
+      # ── FIX 7: Cache Gradle to avoid re-downloading wrapper + dependencies ────
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: ~/.gradle
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*') || 'no-gradle' }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      # ── 10. Install Android cmdline-tools ────────────────────────────────────
+      # ── FIX 8: ROOT CAUSE of "sdkmanager path does not exist" error ──────────
+      # Google removed tools/bin/sdkmanager. It now lives in cmdline-tools/latest/bin/.
+      # We install it and create a legacy symlink so buildozer finds it at the old path.
+      - name: Install Android cmdline-tools
+        run: |
+          CMDTOOLS_URL="https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip"
+          CMDTOOLS_DIR="$ANDROID_HOME/cmdline-tools"
+          mkdir -p "$CMDTOOLS_DIR"
+          wget -q "$CMDTOOLS_URL" -O /tmp/cmdline-tools.zip
+          unzip -q /tmp/cmdline-tools.zip -d /tmp/cmdtools-extract
+          mv /tmp/cmdtools-extract/cmdline-tools "$CMDTOOLS_DIR/latest"
+
+          # Legacy symlink — buildozer 1.5.0 looks for sdkmanager at tools/bin/
+          mkdir -p "$ANDROID_HOME/tools/bin"
+          ln -sf "$CMDTOOLS_DIR/latest/bin/sdkmanager" "$ANDROID_HOME/tools/bin/sdkmanager"
+          ln -sf "$CMDTOOLS_DIR/latest/bin/avdmanager"  "$ANDROID_HOME/tools/bin/avdmanager"
+
+          # Add to PATH for all subsequent steps
+          echo "$CMDTOOLS_DIR/latest/bin" >> $GITHUB_PATH
+          echo "$ANDROID_HOME/platform-tools" >> $GITHUB_PATH
+          echo "$ANDROID_HOME/tools/bin" >> $GITHUB_PATH
+
+      # ── 11. Accept Android SDK licenses ──────────────────────────────────────
+      # ── FIX 9: Must run AFTER cmdline-tools so sdkmanager is available ────────
       - name: Accept Android SDK licenses
         run: |
           mkdir -p "$ANDROID_HOME/licenses"
@@ -105,18 +159,34 @@ jobs:
             > "$ANDROID_HOME/licenses/android-sdk-license"
           printf "84831b9409646a918e30573bab4c9c91346d8abd\n" \
             > "$ANDROID_HOME/licenses/android-sdk-preview-license"
+          printf "33b6a2b64607f11b759f320ef9dff4ae5c47d97a\n" \
+            > "$ANDROID_HOME/licenses/google-gdk-license"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses 2>/dev/null || true
 
-      # ── 10. Prepare output directory ─────────────────────────────────────────
+      # ── 12. Install required SDK components ──────────────────────────────────
+      # ── FIX 10: Pre-install SDK components buildozer will need ────────────────
+      # Without this, buildozer tries to download them mid-build and can fail
+      # or pick incompatible versions.
+      - name: Install Android SDK components
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" "platform-tools"    2>/dev/null || true
+          yes | "$SDKMANAGER" "build-tools;33.0.2" 2>/dev/null || true
+          yes | "$SDKMANAGER" "platforms;android-33" 2>/dev/null || true
+
+      # ── 13. Prepare output directory ─────────────────────────────────────────
       - name: Prepare output directory
         run: mkdir -p bin
 
-      # ── 11. Build APK ─────────────────────────────────────────────────────────
+      # ── 14. Build APK ────────────────────────────────────────────────────────
+      # ── FIX 11: Re-export PATH inline to guarantee all SDK tools are found ────
       - name: Build APK
         run: |
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/tools/bin:$PATH"
           set -o pipefail
           buildozer -v android debug 2>&1 | tee buildozer_build.log
 
-      # ── 12. Locate APK ────────────────────────────────────────────────────────
+      # ── 15. Locate APK ───────────────────────────────────────────────────────
       - name: Locate APK
         if: success()
         run: |
@@ -124,7 +194,7 @@ jobs:
           find . -name "*.apk" 2>/dev/null
           echo "======================="
 
-      # ── 13. Upload APK ────────────────────────────────────────────────────────
+      # ── 16. Upload APK ───────────────────────────────────────────────────────
       - name: Upload APK
         if: success()
         uses: actions/upload-artifact@v4
@@ -134,7 +204,7 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-      # ── 14. Upload build log (always — even on failure) ───────────────────────
+      # ── 17. Upload build log (always — even on failure) ──────────────────────
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
