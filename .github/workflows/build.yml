@@ -1,0 +1,177 @@
+name: Build APK
+
+# ─── Triggers ────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:          # Manual trigger from the Actions tab
+
+# ─── Global timeout: kill the job if it hangs (e.g. stuck download) ──────────
+# First build ~45 min (cold cache), subsequent ~10 min (warm cache)
+timeout-minutes: 60
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-22.04     # 22.04 required — 24.04 breaks several p4a recipes
+
+    env:
+      # Silence buildozer's "running as root" warning (GitHub runners are root)
+      BUILDOZER_WARN_ON_ROOT: "0"
+      # Android SDK/NDK location buildozer will use
+      ANDROID_HOME: /root/.buildozer/android/platform/android-sdk
+      # Speeds up C/C++ compilation inside p4a recipes
+      USE_CCACHE: "1"
+      CCACHE_DIR: /root/.ccache
+
+    steps:
+
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── 2. Java 17 ───────────────────────────────────────────────────────────
+      # Gradle (used by the Android build) requires Java 17.
+      # temurin is the most reliable distribution on ubuntu-22.04.
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      # ── 3. Python 3.11 ───────────────────────────────────────────────────────
+      # Pin to 3.11 explicitly:
+      #   Cython 0.29.x works on 3.11 but is broken on 3.12
+      #   ubuntu-22.04 ships 3.10 by default; this runner may change in future
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ── 4. System dependencies ───────────────────────────────────────────────
+      # Needed by python-for-android recipes:
+      #   build-essential / autoconf / cmake  -> compile C/C++ recipes
+      #   libssl-dev / libffi-dev             -> openssl + cffi recipes
+      #   zlib1g-dev / liblz4-dev             -> compression
+      #   libsqlite3-dev                      -> sqlite recipe
+      #   libc++-dev / libstdc++-12-dev       -> NDK C++ runtime
+      #   ccache                              -> compile cache
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            git zip unzip wget curl \
+            build-essential \
+            libffi-dev libssl-dev \
+            libsqlite3-dev \
+            zlib1g-dev liblz4-dev \
+            libncurses5-dev libncursesw5-dev \
+            libreadline-dev \
+            autoconf automake libtool \
+            pkg-config \
+            cmake ninja-build \
+            libltdl-dev \
+            libc++-dev \
+            libstdc++-12-dev \
+            ccache \
+            python3-dev
+
+      # ── 5. Python packages ───────────────────────────────────────────────────
+      # Pin sh<2  — buildozer 1.5.0 uses sh's old API which breaks on sh>=2.x
+      # Pin Cython 0.29.37 — last version before the 3.x rewrite; kivy needs it
+      # Pin p4a to a known-good release for kivy 2.3.0
+      - name: Install buildozer and dependencies
+        run: |
+          pip install --upgrade pip wheel
+          pip install \
+            "sh>=1.14.2,<2.0.0" \
+            "Cython==0.29.37" \
+            "buildozer==1.5.0" \
+            "python-for-android==2023.9.16"
+
+      # ── 6. Cache: Android SDK + NDK ──────────────────────────────────────────
+      # The SDK/NDK is ~4 GB and takes 15-25 min to download on a cold run.
+      # Key is hardcoded to api33+ndk25b — change it if you update buildozer.spec.
+      - name: Cache Android SDK and NDK
+        uses: actions/cache@v4
+        with:
+          path: /root/.buildozer/android/platform
+          key: android-sdk-ndk-api33-ndk25b-v1
+          restore-keys: |
+            android-sdk-ndk-api33-ndk25b-
+
+      # ── 7. Cache: p4a build artefacts (compiled recipes) ─────────────────────
+      # Keyed on requirements so it invalidates when you change kivy version etc.
+      - name: Cache python-for-android build
+        uses: actions/cache@v4
+        with:
+          path: /root/.buildozer/android/app
+          key: ${{ runner.os }}-p4a-${{ hashFiles('buildozer.spec', 'requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-p4a-
+
+      # ── 8. Cache: ccache (C/C++ object cache) ────────────────────────────────
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: /root/.ccache
+          key: ${{ runner.os }}-ccache-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-
+
+      # ── 9. Accept Android SDK licenses ───────────────────────────────────────
+      # The Android SDK installer requires licence acceptance.
+      # On a cold cache this runs interactively and hangs forever unless we
+      # pre-accept. On a warm cache the SDK is already there — harmless to run.
+      - name: Accept Android SDK licenses
+        run: |
+          mkdir -p "$ANDROID_HOME/licenses"
+          printf "24333f8a63b6825ea9c5514f83c2829b004d1fee\nd56f5187479451eabf01fb78af6dfcb131a6481e\n" \
+            > "$ANDROID_HOME/licenses/android-sdk-license"
+          printf "84831b9409646a918e30573bab4c9c91346d8abd\n" \
+            > "$ANDROID_HOME/licenses/android-sdk-preview-license"
+
+      # ── 10. Prepare output directory ─────────────────────────────────────────
+      # If the build fails early, bin/ may not be created.
+      - name: Prepare output directory
+        run: mkdir -p bin
+
+      # ── 11. Build APK ─────────────────────────────────────────────────────────
+      # set -o pipefail: makes the step fail if buildozer exits non-zero,
+      # even though output is piped through tee.
+      # Without pipefail, a buildozer failure would look like a success
+      # because tee's exit code (0) becomes the step's exit code.
+      - name: Build APK
+        run: |
+          set -o pipefail
+          buildozer -v android debug 2>&1 | tee buildozer_build.log
+
+      # ── 12. Locate APK ────────────────────────────────────────────────────────
+      - name: Locate APK
+        if: success()
+        run: |
+          echo "=== APK files found ==="
+          find . -name "*.apk" 2>/dev/null
+          echo "======================="
+
+      # ── 13. Upload APK ────────────────────────────────────────────────────────
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: VerseRacer-debug-apk
+          path: bin/*.apk
+          retention-days: 30
+          if-no-files-found: warn
+
+      # ── 14. Upload build log (always — even on failure) ───────────────────────
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildozer-log
+          path: buildozer_build.log
+          retention-days: 14
+          if-no-files-found: warn
