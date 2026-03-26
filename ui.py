@@ -1,0 +1,1237 @@
+"""
+VerseRacer - UI Screens and Widgets (Kivy)
+Made by KERVY NALAM
+
+FIXES applied vs original:
+  - ScrollView(child=...) replaced with sv.add_widget(...)  [Kivy API bug]
+  - MPGameScreen canvas background rects properly tracked per section
+  - Partial lambda capture fixed for section pos/size bindings
+  - Added countdown (3-2-1-GO) before every race
+  - 3-4 player GridLayout properly sized
+  - ResultsScreen button layout cleaned up
+  - AI verse index check fixed
+  - Game screen verse-progress bar added
+  - Endless mode multi-verse support fixed
+"""
+
+from kivy.app import App
+from kivy.uix.screenmanager import ScreenManager, Screen, SlideTransition
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.floatlayout import FloatLayout
+from kivy.uix.label import Label
+from kivy.uix.button import Button
+from kivy.uix.textinput import TextInput
+from kivy.uix.popup import Popup
+from kivy.uix.spinner import Spinner
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.widget import Widget
+from kivy.uix.progressbar import ProgressBar
+from kivy.graphics import Color, Rectangle, Line, Ellipse
+from kivy.clock import Clock
+from kivy.core.window import Window
+from kivy.metrics import dp, sp
+from kivy.properties import StringProperty, NumericProperty, ListProperty
+from kivy.utils import get_color_from_hex
+from functools import partial
+
+import time
+from game import GameState
+from leaderboard import add_entry, get_top, calculate_score
+from ai import AIOpponent, AI_PROFILES
+from multiplayer import PlayerSession, PLAYER_COLORS, COLOR_NAMES
+from verses import get_random_verse, get_reference
+from sounds import sfx
+
+# ============ COLORS ============
+BG_COLOR       = get_color_from_hex("#1a1a2e")
+PANEL_COLOR    = get_color_from_hex("#16213e")
+ACCENT_COLOR   = get_color_from_hex("#0f3460")
+HIGHLIGHT      = get_color_from_hex("#e94560")
+TEXT_COLOR     = get_color_from_hex("#eaeaea")
+GREEN          = get_color_from_hex("#00e676")
+RED            = get_color_from_hex("#ff1744")
+YELLOW         = get_color_from_hex("#ffeb3b")
+ROAD_COLOR     = get_color_from_hex("#37474f")
+ROAD_LINE      = get_color_from_hex("#ffeb3b")
+
+
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
+
+def _make_bg(widget, color):
+    """Attach a solid background rectangle to a widget and keep it in sync."""
+    with widget.canvas.before:
+        Color(*color)
+        rect = Rectangle(pos=widget.pos, size=widget.size)
+    widget.bind(
+        pos=lambda w, v: setattr(rect, 'pos', v),
+        size=lambda w, v: setattr(rect, 'size', v),
+    )
+    return rect
+
+
+def _scrolled(inner):
+    """Wrap `inner` widget in a ScrollView and return the ScrollView."""
+    sv = ScrollView(do_scroll_x=False)
+    sv.add_widget(inner)
+    return sv
+
+
+# ─────────────────────────────────────────────
+# Reusable widgets
+# ─────────────────────────────────────────────
+
+class StyledButton(Button):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.background_normal  = ''
+        self.background_color   = HIGHLIGHT
+        self.color              = TEXT_COLOR
+        self.font_size          = sp(15)
+        self.size_hint_y        = None
+        self.height             = dp(48)
+        self.bold               = True
+
+
+class CarWidget(Widget):
+    """Single-car track strip."""
+    car_color = ListProperty([0.2, 0.7, 0.3, 1])
+    progress  = NumericProperty(0)
+
+    def __init__(self, **kwargs):
+        self.car_color = kwargs.pop('car_color', [0.2, 0.7, 0.3, 1])
+        super().__init__(**kwargs)
+        self.bind(pos=self._draw, size=self._draw,
+                  progress=self._draw, car_color=self._draw)
+
+    def _draw(self, *_):
+        self.canvas.clear()
+        with self.canvas:
+            # Road bed
+            Color(*ROAD_COLOR)
+            Rectangle(pos=self.pos, size=self.size)
+            # Dashed centre line
+            Color(*ROAD_LINE)
+            y_mid = self.y + self.height / 2
+            step = int(dp(30))
+            dash = int(dp(15))
+            for x in range(0, int(self.width), step):
+                Line(points=[self.x + x, y_mid,
+                              self.x + x + dash, y_mid], width=1.2)
+            # Car body
+            cw   = dp(34)
+            ch   = self.height * 0.62
+            cx   = self.x + dp(5) + self.progress * (self.width - cw - dp(10))
+            cy   = self.y + (self.height - ch) / 2
+            Color(*self.car_color)
+            Rectangle(pos=(cx, cy), size=(cw, ch))
+            # Windshield
+            Color(0.5, 0.85, 1.0, 0.7)
+            Rectangle(pos=(cx + dp(6), cy + ch * 0.45),
+                       size=(cw - dp(12), ch * 0.35))
+            # Wheels
+            Color(0.15, 0.15, 0.15, 1)
+            Ellipse(pos=(cx + dp(2),          cy - dp(4)), size=(dp(9), dp(9)))
+            Ellipse(pos=(cx + cw - dp(11),    cy - dp(4)), size=(dp(9), dp(9)))
+
+
+class MultiTrackWidget(Widget):
+    """Shows every racer in their own lane with name label + YOU indicator."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.cars = []   # [(name, color, progress, is_player), ...]
+        self.bind(pos=self._draw, size=self._draw)
+
+    def set_cars(self, cars):
+        self.cars = cars
+        self._draw()
+
+    def _draw(self, *_):
+        from kivy.core.text import Label as CoreLabel
+        self.canvas.clear()
+        n = len(self.cars)
+        if n == 0:
+            return
+
+        label_w   = dp(54)          # reserved width on left for name
+        track_x   = self.x + label_w
+        track_w   = self.width - label_w
+        lane_h    = self.height / n
+
+        with self.canvas:
+            for i, (name, color, progress, is_player) in enumerate(self.cars):
+                lane_y = self.y + i * lane_h
+
+                # ── Lane background ──────────────────────────
+                Color(*ROAD_COLOR)
+                Rectangle(pos=(track_x, lane_y), size=(track_w, lane_h - dp(2)))
+
+                # ── Dashed centre line ───────────────────────
+                Color(*ROAD_LINE)
+                y_mid = lane_y + lane_h / 2
+                step  = int(dp(18))
+                for x in range(0, int(track_w), step):
+                    Line(points=[track_x + x, y_mid,
+                                  track_x + x + dp(9), y_mid], width=1)
+
+                # ── Car ──────────────────────────────────────
+                cw = dp(22)
+                ch = lane_h * 0.52
+                cx = track_x + dp(3) + progress * (track_w - cw - dp(6))
+                cy = lane_y + (lane_h - ch) / 2
+                Color(*color)
+                Rectangle(pos=(cx, cy), size=(cw, ch))
+                # Windshield
+                Color(0.5, 0.85, 1.0, 0.7)
+                Rectangle(pos=(cx + dp(4), cy + ch * 0.45),
+                           size=(cw - dp(8), ch * 0.30))
+                # Wheels
+                Color(0.1, 0.1, 0.1, 1)
+                Ellipse(pos=(cx + dp(1),        cy - dp(3)), size=(dp(7), dp(7)))
+                Ellipse(pos=(cx + cw - dp(8),   cy - dp(3)), size=(dp(7), dp(7)))
+
+                # "YOU" arrow on player car
+                if is_player:
+                    Color(*YELLOW)
+                    # Draw small downward arrow above car
+                    ax = cx + cw / 2
+                    ay = cy + ch + dp(2)
+                    Line(points=[ax, ay + dp(7), ax, ay], width=dp(1.5))
+                    Line(points=[ax - dp(4), ay + dp(4), ax, ay, ax + dp(4), ay + dp(4)], width=dp(1.5))
+
+                # ── Name label (left panel) ───────────────────
+                name_color = list(color[:3]) + [1]
+                lbl_text = ("▶ " if is_player else "  ") + (name[:6] if len(name) > 6 else name)
+                core_lbl = CoreLabel(text=lbl_text,
+                                     font_size=sp(10),
+                                     bold=is_player)
+                core_lbl.refresh()
+                tex = core_lbl.texture
+                lx  = self.x + dp(2)
+                ly  = lane_y + (lane_h - tex.height) / 2
+                Color(*name_color)
+                Rectangle(texture=tex, pos=(lx, ly), size=tex.size)
+
+
+# ─────────────────────────────────────────────
+# Countdown overlay (reusable)
+# ─────────────────────────────────────────────
+
+class CountdownOverlay(FloatLayout):
+    """Full-screen 3-2-1-GO overlay. Calls on_done() when finished."""
+
+    def __init__(self, on_done, **kwargs):
+        super().__init__(**kwargs)
+        self.on_done = on_done
+        self._count = 3
+
+        with self.canvas.before:
+            Color(0, 0, 0, 0.65)
+            self._bg = Rectangle(pos=self.pos, size=self.size)
+        self.bind(pos=lambda w, v: setattr(self._bg, 'pos', v),
+                  size=lambda w, v: setattr(self._bg, 'size', v))
+
+        self.lbl = Label(text="3", font_size=sp(72), bold=True,
+                          color=YELLOW, pos_hint={'center_x': 0.5, 'center_y': 0.55})
+        self.sub = Label(text="Get ready…", font_size=sp(18),
+                          color=TEXT_COLOR, pos_hint={'center_x': 0.5, 'center_y': 0.42})
+        self.add_widget(self.lbl)
+        self.add_widget(self.sub)
+
+        Clock.schedule_interval(self._tick, 1.0)
+
+    def _tick(self, dt):
+        self._count -= 1
+        if self._count > 0:
+            self.lbl.text = str(self._count)
+            self.lbl.color = YELLOW
+        elif self._count == 0:
+            self.lbl.text = "GO!"
+            self.lbl.color = GREEN
+            self.sub.text  = ""
+            sfx.play("go")
+        else:
+            self.parent.remove_widget(self)
+            self.on_done()
+            return False   # stop clock
+
+
+# ─────────────────────────────────────────────
+# SCREENS
+# ─────────────────────────────────────────────
+
+class MenuScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._build()
+
+    def _build(self):
+        inner = BoxLayout(orientation='vertical', padding=dp(20),
+                           spacing=dp(10), size_hint_y=None)
+        inner.bind(minimum_height=inner.setter('height'))
+
+        _make_bg(self, BG_COLOR)
+
+        # Title block
+        inner.add_widget(Label(
+            text="🏎️ VerseRacer", font_size=sp(34), bold=True,
+            color=HIGHLIGHT, size_hint_y=None, height=dp(56)))
+        inner.add_widget(Label(
+            text="Type fast. Race hard.",
+            font_size=sp(13), color=TEXT_COLOR,
+            size_hint_y=None, height=dp(22)))
+        inner.add_widget(Label(
+            text="Made by KERVY NALAM",
+            font_size=sp(10), color=(0.6, 0.6, 0.7, 1),
+            size_hint_y=None, height=dp(18)))
+        inner.add_widget(Widget(size_hint_y=None, height=dp(8)))
+
+        modes = [
+            ("🏁  Classic Mode",       "classic"),
+            ("⏱️  Time Attack",         "time_attack"),
+            ("🎯  Accuracy Mode",       "accuracy"),
+            ("💀  Hard Mode",           "hard"),
+            ("♾️  Endless Mode",        "endless"),
+            ("🤖  VS AI Mode",          "vs_ai"),
+            ("👥  Local Multiplayer",   "multiplayer"),
+        ]
+        for label, mode in modes:
+            btn = StyledButton(text=label)
+            btn.bind(on_release=partial(self._start_mode, mode))
+            inner.add_widget(btn)
+
+        inner.add_widget(Widget(size_hint_y=None, height=dp(6)))
+
+        snd_btn = StyledButton(text="🔊 Toggle Sound")
+        snd_btn.background_color = ACCENT_COLOR
+        snd_btn.bind(on_release=lambda *_: sfx.toggle())
+        inner.add_widget(snd_btn)
+
+        lb_btn = StyledButton(text="🏆 Leaderboard")
+        lb_btn.background_color = ACCENT_COLOR
+        lb_btn.bind(on_release=lambda *_: setattr(self.manager, 'current', 'leaderboard'))
+        inner.add_widget(lb_btn)
+
+        inner.add_widget(Widget(size_hint_y=None, height=dp(10)))
+
+        self.add_widget(_scrolled(inner))
+
+    def _start_mode(self, mode, *_):
+        if mode == "vs_ai":
+            self.manager.current = "ai_setup"
+        elif mode == "multiplayer":
+            self.manager.current = "mp_setup"
+        else:
+            self._ensure_name(mode)
+
+    def _ensure_name(self, mode):
+        app = App.get_running_app()
+        if app.player_name and app.player_name != "Player":
+            self._launch(mode)
+            return
+
+        content = BoxLayout(orientation='vertical', spacing=dp(10), padding=dp(15))
+        ti = TextInput(hint_text="Enter your name", multiline=False,
+                        font_size=sp(17), size_hint_y=None, height=dp(44))
+        popup = Popup(title="Your Name", size_hint=(0.82, 0.32))
+
+        def _go(*_):
+            app.player_name = ti.text.strip() or "Player"
+            popup.dismiss()
+            self._launch(mode)
+
+        btn = StyledButton(text="Start!")
+        btn.bind(on_release=_go)
+        content.add_widget(ti)
+        content.add_widget(btn)
+        popup.content = content
+        popup.open()
+
+    def _launch(self, mode):
+        screen = self.manager.get_screen("game")
+        screen.setup_game(mode)
+        self.manager.current = "game"
+
+
+# ─────────────────────────────────────────────
+
+class AISetupScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        _make_bg(self, BG_COLOR)
+
+        layout = BoxLayout(orientation='vertical', padding=dp(20), spacing=dp(12))
+
+        layout.add_widget(Label(text="🤖 VS AI Setup", font_size=sp(26), bold=True,
+                                 color=HIGHLIGHT, size_hint_y=None, height=dp(48)))
+
+        layout.add_widget(Label(text="Your Name:", color=TEXT_COLOR,
+                                 size_hint_y=None, height=dp(28), font_size=sp(13)))
+        self.name_input = TextInput(hint_text="Player", multiline=False,
+                                     size_hint_y=None, height=dp(42), font_size=sp(15))
+        layout.add_widget(self.name_input)
+
+        layout.add_widget(Label(text="Number of AI opponents (1–3):",
+                                 color=TEXT_COLOR, size_hint_y=None,
+                                 height=dp(28), font_size=sp(13)))
+        self.ai_count = Spinner(text="1", values=["1", "2", "3"],
+                                 size_hint_y=None, height=dp(42), font_size=sp(15))
+        layout.add_widget(self.ai_count)
+
+        layout.add_widget(Label(text="AI Difficulty:", color=TEXT_COLOR,
+                                 size_hint_y=None, height=dp(28), font_size=sp(13)))
+        self.difficulty = Spinner(text="rookie",
+                                   values=["rookie", "amateur", "pro", "legend"],
+                                   size_hint_y=None, height=dp(42), font_size=sp(15))
+        layout.add_widget(self.difficulty)
+
+        # Difficulty legend
+        legend = (
+            "Rookie ~25 WPM  |  Amateur ~45 WPM\n"
+            "Pro ~70 WPM  |  Legend ~100 WPM (adaptive)"
+        )
+        layout.add_widget(Label(text=legend, color=(0.7, 0.7, 0.8, 1),
+                                 font_size=sp(11), size_hint_y=None, height=dp(38),
+                                 halign='center',
+                                 text_size=(Window.width - dp(40), None)))
+
+        btn = StyledButton(text="🏁 Start Race!")
+        btn.bind(on_release=self._start)
+        layout.add_widget(btn)
+
+        back = StyledButton(text="← Back")
+        back.background_color = ACCENT_COLOR
+        back.bind(on_release=lambda *_: setattr(self.manager, 'current', 'menu'))
+        layout.add_widget(back)
+
+        self.add_widget(layout)
+
+    def _start(self, *_):
+        app = App.get_running_app()
+        app.player_name = self.name_input.text.strip() or "Player"
+        screen = self.manager.get_screen("game")
+        screen.setup_game("vs_ai",
+                           ai_count=int(self.ai_count.text),
+                           ai_difficulty=self.difficulty.text)
+        self.manager.current = "game"
+
+
+# ─────────────────────────────────────────────
+
+class MPSetupScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        _make_bg(self, BG_COLOR)
+        self._build()
+
+    def _build(self):
+        self.clear_widgets()
+        _make_bg(self, BG_COLOR)
+
+        inner = BoxLayout(orientation='vertical', padding=dp(20),
+                           spacing=dp(10), size_hint_y=None)
+        inner.bind(minimum_height=inner.setter('height'))
+
+        inner.add_widget(Label(text="👥 Multiplayer Setup", font_size=sp(22),
+                                bold=True, color=HIGHLIGHT,
+                                size_hint_y=None, height=dp(44)))
+
+        inner.add_widget(Label(text="Number of players (2–4):",
+                                color=TEXT_COLOR, size_hint_y=None,
+                                height=dp(26), font_size=sp(13)))
+        self.player_count = Spinner(text="2", values=["2", "3", "4"],
+                                     size_hint_y=None, height=dp(40), font_size=sp(15))
+        inner.add_widget(self.player_count)
+
+        inner.add_widget(Label(text="Player Names:", color=TEXT_COLOR,
+                                size_hint_y=None, height=dp(24), font_size=sp(13)))
+        self.name_inputs = []
+        for i in range(4):
+            row = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(8))
+            dot = Label(text=f"P{i+1}", color=list(PLAYER_COLORS[i]),
+                         font_size=sp(13), size_hint_x=0.15, bold=True)
+            ti = TextInput(hint_text=f"Player {i+1}",
+                            multiline=False, font_size=sp(13))
+            row.add_widget(dot)
+            row.add_widget(ti)
+            inner.add_widget(row)
+            self.name_inputs.append(ti)
+
+        inner.add_widget(Label(text="Game Mode:", color=TEXT_COLOR,
+                                size_hint_y=None, height=dp(26), font_size=sp(13)))
+        self.mode_spinner = Spinner(
+            text="classic",
+            values=["classic", "time_attack", "endless"],
+            size_hint_y=None, height=dp(40), font_size=sp(14))
+        inner.add_widget(self.mode_spinner)
+
+        inner.add_widget(Label(
+            text="Tip: In Endless mode each player ends their own race.",
+            color=(0.6, 0.7, 0.8, 1), font_size=sp(10),
+            size_hint_y=None, height=dp(22),
+            text_size=(Window.width - dp(40), None), halign='center'))
+
+        btn = StyledButton(text="🏁 Start Race!")
+        btn.bind(on_release=self._start)
+        inner.add_widget(btn)
+
+        back = StyledButton(text="← Back")
+        back.background_color = ACCENT_COLOR
+        back.bind(on_release=lambda *_: setattr(self.manager, 'current', 'menu'))
+        inner.add_widget(back)
+
+        inner.add_widget(Widget(size_hint_y=None, height=dp(10)))
+
+        self.add_widget(_scrolled(inner))
+
+    def _start(self, *_):
+        count = int(self.player_count.text)
+        players = []
+        for i in range(count):
+            name = self.name_inputs[i].text.strip() or f"Player {i+1}"
+            players.append(PlayerSession(name, PLAYER_COLORS[i], i))
+
+        screen = self.manager.get_screen("mp_game")
+        screen.setup_game(players, self.mode_spinner.text)
+        self.manager.current = "mp_game"
+
+
+# ─────────────────────────────────────────────
+
+class GameScreen(Screen):
+    """Single-player + VS-AI game screen."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.game          = None
+        self.ai_opponents  = []
+        self._event        = None
+
+    def setup_game(self, mode, ai_count=0, ai_difficulty="rookie"):
+        self.clear_widgets()
+        self.game = GameState(mode)
+        self.game.setup()
+
+        self.ai_opponents = []
+        if mode == "vs_ai":
+            diff_order = list(AI_PROFILES.keys())
+            for i in range(ai_count):
+                d = ai_difficulty if i == 0 else diff_order[min(i, len(diff_order) - 1)]
+                ai = AIOpponent(d)
+                ai.start_race(len(self.game.current_verse))
+                self.ai_opponents.append(ai)
+
+        # ── Build UI ──────────────────────────────
+        root = FloatLayout()
+        _make_bg(root, BG_COLOR)
+
+        # layout fills the visible area above the keyboard
+        layout = BoxLayout(orientation='vertical', padding=dp(10), spacing=dp(6),
+                            size_hint=(1, None))
+        layout.height = Window.height - Window.keyboard_height
+
+        def _on_keyboard_height(window, height):
+            layout.height = window.height - height
+
+        Window.bind(keyboard_height=_on_keyboard_height)
+        self._keyboard_binding = _on_keyboard_height   # keep reference
+
+        # Stats bar
+        stats = BoxLayout(size_hint_y=None, height=dp(28), spacing=dp(6))
+        self.mode_label  = Label(text=mode.upper(), color=HIGHLIGHT,
+                                  font_size=sp(12), bold=True)
+        self.wpm_label   = Label(text="WPM: 0",    color=GREEN, font_size=sp(12), bold=True)
+        self.acc_label   = Label(text="Acc: 100%", color=TEXT_COLOR, font_size=sp(12))
+        self.time_label  = Label(text="0.0s",       color=TEXT_COLOR, font_size=sp(12))
+        self.verse_count_label = Label(text="1/5",  color=YELLOW, font_size=sp(12), bold=True)
+        for w in (self.mode_label, self.wpm_label, self.acc_label,
+                  self.time_label, self.verse_count_label):
+            stats.add_widget(w)
+        layout.add_widget(stats)
+
+        # Bible verse reference label (hidden for non-bible verses)
+        ref = get_reference(self.game.current_verse)
+        self.ref_label = Label(
+            text=ref,
+            color=YELLOW,
+            font_size=sp(11),
+            bold=True,
+            text_size=(Window.width - dp(24), None),
+            halign='left',
+            size_hint_y=None,
+            height=dp(18) if ref else dp(0),
+            opacity=1 if ref else 0)
+        layout.add_widget(self.ref_label)
+
+        # Verse display
+        self.verse_label = Label(
+            text=self.game.current_verse,
+            color=TEXT_COLOR,
+            font_size=sp(15),
+            text_size=(Window.width - dp(24), None),
+            halign='left', valign='top',
+            size_hint_y=None,
+            height=dp(90),
+            markup=True)
+        layout.add_widget(self.verse_label)
+
+        # Verse progress bar
+        self.verse_bar = ProgressBar(
+            max=1.0, value=0,
+            size_hint_y=None, height=dp(6))
+        layout.add_widget(self.verse_bar)
+
+        # Time Attack countdown bar (only shown in time_attack mode)
+        if mode == "time_attack":
+            self.time_bar = ProgressBar(
+                max=60, value=60,
+                size_hint_y=None, height=dp(6))
+            layout.add_widget(self.time_bar)
+        else:
+            self.time_bar = None
+
+        # ── Race track area ───────────────────────
+        if self.ai_opponents:
+            # VS AI: one multi-lane track showing player + all AIs
+            app = App.get_running_app()
+            player_name = app.player_name or "You"
+            # Height scales with number of racers (player + AIs)
+            n_racers = 1 + len(self.ai_opponents)
+            track_h = dp(38) * n_racers
+            self.multi_track = MultiTrackWidget(size_hint_y=None, height=track_h)
+            layout.add_widget(self.multi_track)
+            self.car_widget = None   # not used in VS AI mode
+        else:
+            # Solo modes: single car strip
+            self.car_widget = CarWidget(size_hint_y=None, height=dp(50),
+                                         car_color=[0.2, 0.7, 0.3, 1])
+            layout.add_widget(self.car_widget)
+            self.multi_track = None
+
+        # Text input
+        self.text_input = TextInput(
+            hint_text="Start typing the verse here…",
+            multiline=False, font_size=sp(15),
+            size_hint_y=None, height=dp(44))
+        self.text_input.bind(text=self._on_text)
+        layout.add_widget(self.text_input)
+
+        # Button row
+        btn_row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        if mode == "endless":
+            end_btn = StyledButton(text="🛑 End Race", height=dp(44))
+            end_btn.bind(on_release=lambda *_: self._end_race())
+            btn_row.add_widget(end_btn)
+        menu_btn = StyledButton(text="← Menu", height=dp(44))
+        menu_btn.background_color = ACCENT_COLOR
+        menu_btn.bind(on_release=lambda *_: self._go_menu())
+        btn_row.add_widget(menu_btn)
+        layout.add_widget(btn_row)
+
+        root.add_widget(layout)
+        self.add_widget(root)
+        self._root_layout = root
+
+        # Countdown then start
+        sfx.play("engine_rev")
+        sfx.start_music()
+        overlay = CountdownOverlay(on_done=self._begin, size_hint=(1, 1))
+        root.add_widget(overlay)
+
+    def _begin(self):
+        """Called after countdown finishes."""
+        self.game.start_time = time.time()  # reset clock so countdown doesn't count
+        self.text_input.focus = True
+        if self._event:
+            self._event.cancel()
+        self._event = Clock.schedule_interval(self._update, 1 / 30.0)
+
+    def _on_text(self, instance, value):
+        if not self.game or self.game.is_finished or not self.game.is_running:
+            return
+        sfx.play("key_tap")
+
+        verse_before = self.game.current_verse_index
+        result = self.game.on_text_change(value)
+        if result is not None and result != value:
+            self.text_input.text = result
+            return   # text was corrected (hard mode), re-render will follow
+
+        # Verse was completed → clear input box and refresh display
+        if self.game.current_verse_index != verse_before or (self.game.is_finished and value != ""):
+            self.text_input.text = ""
+            for ai in self.ai_opponents:
+                ai.set_verse(len(self.game.current_verse))
+
+        self._update_verse_display()
+
+        if self.game.is_finished:
+            self._show_results()
+
+    def _update_verse_display(self):
+        statuses = self.game.get_char_statuses()
+        markup = ""
+        for ch, status in statuses:
+            if status == "correct":
+                markup += f"[color=00e676]{ch}[/color]"
+            elif status == "wrong":
+                markup += f"[color=ff1744]{ch}[/color]"
+            else:
+                markup += f"[color=cccccc]{ch}[/color]"
+        self.verse_label.text = markup
+
+        # Update reference label for current verse
+        ref = get_reference(self.game.current_verse)
+        self.ref_label.text    = ref
+        self.ref_label.height  = dp(18) if ref else dp(0)
+        self.ref_label.opacity = 1 if ref else 0
+
+    def _update(self, dt):
+        if not self.game or self.game.is_finished:
+            return
+        self.game.update(dt)
+
+        self.wpm_label.text    = f"WPM: {self.game.get_wpm():.0f}"
+        self.acc_label.text    = f"Acc: {self.game.get_overall_accuracy():.0f}%"
+        self.time_label.text   = f"{self.game.elapsed_time:.1f}s"
+        self.verse_bar.value   = self.game.car_position
+
+        # Solo car widget (not shown in VS AI)
+        if self.car_widget:
+            self.car_widget.progress = self.game.car_position
+
+        # Verse counter
+        total_v = len(self.game.verses)
+        cur_v   = min(self.game.current_verse_index + 1, total_v)
+        if self.game.mode in ("endless", "time_attack", "accuracy"):
+            self.verse_count_label.text = f"#{cur_v}"
+        else:
+            self.verse_count_label.text = f"{cur_v}/{total_v}"
+
+        # Time Attack countdown bar
+        if self.time_bar is not None:
+            remaining = max(0, self.game.time_limit - self.game.elapsed_time)
+            self.time_bar.value = remaining
+
+        # Update AI opponents
+        for ai in self.ai_opponents:
+            ai.update(dt, self.game.car_position)
+            if ai.is_verse_done() and not ai.finished:
+                ai.finish_verse()
+                total_verses = len(self.game.verses)
+                if ai.verses_completed >= total_verses:
+                    ai.mark_finished()
+                else:
+                    ai.set_verse(len(self.game.current_verse))
+
+        # Multi-track: player first (is_player=True), then AIs
+        if self.multi_track:
+            app = App.get_running_app()
+            player_name = app.player_name or "You"
+            cars = [(player_name, [0.2, 0.7, 0.3, 1], self.game.car_position, True)]
+            for ai in self.ai_opponents:
+                cars.append((ai.name, list(ai.color), ai.get_progress(), False))
+            self.multi_track.set_cars(cars)
+
+        if self.game.is_finished:
+            self._show_results()
+
+    def _end_race(self):
+        if self.game:
+            self.game.finish()
+            self._show_results()
+
+    def _show_results(self):
+        if self._event:
+            self._event.cancel()
+            self._event = None
+        sfx.stop_music()
+        sfx.play("fanfare")
+
+        app      = App.get_running_app()
+        wpm      = self.game.get_wpm()
+        acc      = self.game.get_overall_accuracy()
+        elapsed  = self.game.elapsed_time
+        score    = calculate_score(wpm, acc, elapsed)
+
+        add_entry(app.player_name, score, wpm, acc, self.game.mode)
+
+        participants = [{"name": app.player_name, "wpm": wpm, "accuracy": acc,
+                          "time": elapsed, "score": score, "is_player": True}]
+        for ai in self.ai_opponents:
+            ai_wpm   = ai.get_wpm()
+            ai_acc   = ai.get_accuracy()
+            ai_time  = ai.finish_time if ai.finished else elapsed
+            ai_score = calculate_score(ai_wpm, ai_acc, ai_time)
+            participants.append({"name": ai.name, "wpm": ai_wpm, "accuracy": ai_acc,
+                                  "time": ai_time, "score": ai_score, "is_player": False})
+
+        screen = self.manager.get_screen("results")
+        screen.show_results(participants, self.game.mode)
+        self.manager.current = "results"
+
+    def _go_menu(self):
+        sfx.stop_music()
+        if self._event:
+            self._event.cancel()
+            self._event = None
+        if hasattr(self, '_keyboard_binding') and self._keyboard_binding:
+            Window.unbind(keyboard_height=self._keyboard_binding)
+            self._keyboard_binding = None
+        self.manager.current = "menu"
+
+
+# ─────────────────────────────────────────────
+
+class MPGameScreen(Screen):
+    """Local multiplayer game screen — 2 to 4 players."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.players     = []
+        self.games       = []
+        self.mode        = "classic"
+        self._event      = None
+        self.next_place  = 1
+        self._verse      = ""
+
+    # ── Setup ─────────────────────────────────
+
+    def setup_game(self, players, mode):
+        self.clear_widgets()
+        self.players    = players
+        self.mode       = mode
+        self.next_place = 1
+        self._verse     = get_random_verse()
+
+        self.games       = []
+        self.inputs      = []
+        self.car_widgets = []
+        self.stat_labels = []
+        self.verse_labels = []
+
+        count = len(players)
+
+        # Root
+        root = FloatLayout()
+        _make_bg(root, BG_COLOR)
+
+        outer = BoxLayout(orientation='vertical', padding=dp(4), spacing=dp(4),
+                           size_hint=(1, None))
+        outer.height = Window.height - Window.keyboard_height
+
+        def _mp_keyboard_height(window, height):
+            outer.height = window.height - height
+
+        Window.bind(keyboard_height=_mp_keyboard_height)
+        self._keyboard_binding = _mp_keyboard_height
+
+        # Choose layout: 1 column for ≤2, 2-column grid for 3-4
+        if count <= 2:
+            container = BoxLayout(orientation='vertical', spacing=dp(4))
+        else:
+            container = GridLayout(cols=2, spacing=dp(4), size_hint_y=1)
+
+        for i, player in enumerate(players):
+            player.reset()
+            player.start_time = time.time()
+
+            game = GameState(mode)
+            game.setup()
+            game.current_verse = self._verse
+            game.verses        = [self._verse]
+            self.games.append(game)
+
+            section = self._build_player_section(i, player, count)
+            container.add_widget(section)
+
+        outer.add_widget(container)
+
+        menu_btn = StyledButton(text="← Menu", height=dp(38))
+        menu_btn.size_hint_y = None
+        menu_btn.background_color = ACCENT_COLOR
+        menu_btn.bind(on_release=lambda *_: self._go_menu())
+        outer.add_widget(menu_btn)
+
+        root.add_widget(outer)
+        self.add_widget(root)
+        self._root = root
+
+        # Countdown then start
+        sfx.play("engine_rev")
+        sfx.start_music()
+        overlay = CountdownOverlay(on_done=self._begin, size_hint=(1, 1))
+        root.add_widget(overlay)
+
+    def _build_player_section(self, i, player, total):
+        """Build the UI block for one player."""
+        section = BoxLayout(orientation='vertical', spacing=dp(2), padding=dp(4))
+
+        # Tinted background per player
+        r, g, b, _ = player.color
+        with section.canvas.before:
+            Color(r * 0.25, g * 0.25, b * 0.25, 0.85)
+            sec_bg = Rectangle(pos=section.pos, size=section.size)
+        section.bind(
+            pos=lambda w, v, rect=sec_bg: setattr(rect, 'pos', v),
+            size=lambda w, v, rect=sec_bg: setattr(rect, 'size', v),
+        )
+
+        font_lg = sp(12) if total <= 2 else sp(10)
+        font_sm = sp(11) if total <= 2 else sp(9)
+
+        # Player name
+        name_lbl = Label(text=f"🚗 {player.name}",
+                          color=player.color, font_size=font_lg,
+                          bold=True, size_hint_y=None, height=dp(20))
+        section.add_widget(name_lbl)
+
+        # Verse display (markup-enabled)
+        verse_disp = Label(
+            text=self._verse,
+            color=TEXT_COLOR, font_size=font_sm,
+            size_hint_y=None, height=dp(40) if total <= 2 else dp(32),
+            text_size=(Window.width / (2 if total > 2 else 1) - dp(20), None),
+            halign='left', markup=True)
+        self.verse_labels.append(verse_disp)
+        section.add_widget(verse_disp)
+
+        # Car track
+        car_h = dp(32) if total <= 2 else dp(24)
+        car = CarWidget(size_hint_y=None, height=car_h, car_color=list(player.color))
+        self.car_widgets.append(car)
+        section.add_widget(car)
+
+        # Stats
+        stat = Label(text="WPM: 0 | Acc: 100%", color=GREEN,
+                      font_size=font_sm, size_hint_y=None, height=dp(16))
+        self.stat_labels.append(stat)
+        section.add_widget(stat)
+
+        # Text input
+        ti_h = dp(38) if total <= 2 else dp(30)
+        ti = TextInput(hint_text=f"P{i+1} type here",
+                        multiline=False, font_size=font_sm,
+                        size_hint_y=None, height=ti_h)
+        ti.bind(text=partial(self._on_text, i))
+        self.inputs.append(ti)
+        section.add_widget(ti)
+
+        # Endless quit button
+        if self.mode == "endless":
+            q = Button(text="End", size_hint_y=None, height=dp(26),
+                        font_size=font_sm,
+                        background_normal='',
+                        background_color=HIGHLIGHT)
+            q.bind(on_release=partial(self._player_quit, i))
+            section.add_widget(q)
+
+        return section
+
+    def _begin(self):
+        """Called after countdown — reset timers and start game loop."""
+        now = time.time()
+        for p in self.players:
+            p.start_time = now
+        for g in self.games:
+            g.start_time = now
+            g.is_running = True
+        if self._event:
+            self._event.cancel()
+        self._event = Clock.schedule_interval(self._update, 1 / 30.0)
+
+    # ── Input handling ────────────────────────
+
+    def _on_text(self, player_idx, instance, value):
+        game   = self.games[player_idx]
+        player = self.players[player_idx]
+        if game.is_finished or player.finished:
+            return
+
+        verse_before = game.current_verse_index
+        result = game.on_text_change(value)
+        if result is not None and result != value:
+            self.inputs[player_idx].text = result
+            return
+
+        # Sync player session stats
+        player.total_chars_attempted = max(player.total_chars_attempted, len(value))
+        player.chars_typed           = game.total_distance + len(game.typed_text)
+        player.correct_chars         = game.total_distance + game.correct_count
+
+        # Verse was completed → clear input reliably
+        if game.current_verse_index != verse_before:
+            self.inputs[player_idx].text = ""
+
+        # Update verse label colors
+        self._refresh_verse_label(player_idx, game)
+
+        if game.is_finished and not player.finished:
+            player.finished     = True
+            player.finish_time  = time.time() - player.start_time
+            player.place        = self.next_place
+            self.next_place    += 1
+            self._check_all_done()
+
+    def _refresh_verse_label(self, idx, game):
+        statuses = game.get_char_statuses()
+        markup = ""
+        for ch, status in statuses:
+            if status == "correct":
+                markup += f"[color=00e676]{ch}[/color]"
+            elif status == "wrong":
+                markup += f"[color=ff1744]{ch}[/color]"
+            else:
+                markup += f"[color=cccccc]{ch}[/color]"
+        self.verse_labels[idx].text = markup
+
+    def _player_quit(self, idx, *_):
+        player = self.players[idx]
+        game   = self.games[idx]
+        if not player.finished:
+            game.finish()
+            player.finished    = True
+            player.finish_time = time.time() - player.start_time
+            player.place       = self.next_place
+            self.next_place   += 1
+            self._check_all_done()
+
+    def _check_all_done(self):
+        if all(p.finished for p in self.players):
+            Clock.schedule_once(lambda *_: self._show_results(), 0.5)
+
+    # ── Game loop ─────────────────────────────
+
+    def _update(self, dt):
+        now = time.time()
+        for i, game in enumerate(self.games):
+            game.update(dt)
+            player = self.players[i]
+            wpm    = player.get_wpm(now)
+            acc    = player.get_accuracy()
+            self.stat_labels[i].text = f"WPM: {wpm:.0f} | Acc: {acc:.0f}%"
+            self.car_widgets[i].progress = game.car_position
+            if player.finished:
+                self.stat_labels[i].text += f"  🏁 #{player.place}"
+
+    # ── Results ───────────────────────────────
+
+    def _show_results(self):
+        if self._event:
+            self._event.cancel()
+            self._event = None
+        sfx.stop_music()
+        sfx.play("fanfare")
+
+        now = time.time()
+        participants = []
+        for i, player in enumerate(self.players):
+            wpm   = player.get_wpm(now)
+            acc   = player.get_accuracy()
+            ft    = player.finish_time if player.finish_time else (now - player.start_time)
+            score = calculate_score(wpm, acc, ft)
+            participants.append({
+                "name": player.name, "wpm": wpm, "accuracy": acc,
+                "time": ft, "score": score, "is_player": True,
+                "color": player.color
+            })
+            add_entry(player.name, score, wpm, acc, "multiplayer")
+
+        screen = self.manager.get_screen("results")
+        screen.show_results(participants, self.mode)
+        self.manager.current = "results"
+
+    def _go_menu(self):
+        sfx.stop_music()
+        if self._event:
+            self._event.cancel()
+            self._event = None
+        if hasattr(self, '_keyboard_binding') and self._keyboard_binding:
+            Window.unbind(keyboard_height=self._keyboard_binding)
+            self._keyboard_binding = None
+        self.manager.current = "menu"
+
+
+# ─────────────────────────────────────────────
+
+class ResultsScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def show_results(self, participants, mode):
+        self.clear_widgets()
+        self._last_mode = mode
+        participants.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+        _make_bg(self, BG_COLOR)
+
+        inner = BoxLayout(orientation='vertical', padding=dp(18),
+                           spacing=dp(10), size_hint_y=None)
+        inner.bind(minimum_height=inner.setter('height'))
+
+        inner.add_widget(Label(text="🏁 Race Results!", font_size=sp(26),
+                                bold=True, color=HIGHLIGHT,
+                                size_hint_y=None, height=dp(48)))
+        inner.add_widget(Label(text=f"Mode: {mode.upper()}", font_size=sp(13),
+                                color=TEXT_COLOR, size_hint_y=None, height=dp(24)))
+
+        medals = ["🥇", "🥈", "🥉"]
+        for i, p in enumerate(participants):
+            medal = medals[i] if i < 3 else f"#{i + 1}"
+            name_color = (
+                list(p["color"]) if "color" in p and p.get("is_player")
+                else (GREEN if p.get("is_player") else list(TEXT_COLOR))
+            )
+            # Name + medal row
+            row = BoxLayout(size_hint_y=None, height=dp(24))
+            row.add_widget(Label(
+                text=f"{medal} {p['name']}",
+                color=name_color, font_size=sp(13), bold=True,
+                halign='left',
+                text_size=(Window.width * 0.55, None)))
+            row.add_widget(Label(
+                text=f"Score {p['score']:.0f}",
+                color=YELLOW, font_size=sp(12), bold=True))
+            inner.add_widget(row)
+
+            # Stats row
+            stats_txt = (f"   WPM: {p['wpm']:.1f}  |  "
+                          f"Acc: {p['accuracy']:.1f}%  |  "
+                          f"Time: {p['time']:.1f}s")
+            inner.add_widget(Label(
+                text=stats_txt, color=(0.75, 0.75, 0.85, 1),
+                font_size=sp(11), size_hint_y=None, height=dp(20),
+                halign='left',
+                text_size=(Window.width - dp(40), None)))
+
+        inner.add_widget(Widget(size_hint_y=None, height=dp(8)))
+
+        # Buttons
+        btn_row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+        menu_btn = StyledButton(text="🏠 Menu")
+        menu_btn.bind(on_release=lambda *_: setattr(self.manager, 'current', 'menu'))
+        btn_row.add_widget(menu_btn)
+
+        again_btn = StyledButton(text="🔄 Play Again")
+        again_btn.background_color = GREEN[:3] + [1]
+        again_btn.bind(on_release=self._play_again)
+        btn_row.add_widget(again_btn)
+
+        lb_btn = StyledButton(text="🏆 Board")
+        lb_btn.background_color = ACCENT_COLOR
+        lb_btn.bind(on_release=lambda *_: setattr(self.manager, 'current', 'leaderboard'))
+        btn_row.add_widget(lb_btn)
+        inner.add_widget(btn_row)
+
+        snd_btn = StyledButton(text="🔊 Toggle Sound")
+        snd_btn.background_color = ACCENT_COLOR
+        snd_btn.bind(on_release=lambda *_: sfx.toggle())
+        inner.add_widget(snd_btn)
+
+        inner.add_widget(Label(text="Made by KERVY NALAM", font_size=sp(9),
+                                color=(0.45, 0.45, 0.55, 1),
+                                size_hint_y=None, height=dp(16)))
+
+        self.add_widget(_scrolled(inner))
+
+    def _play_again(self, *_):
+        mode = getattr(self, '_last_mode', 'classic')
+        if mode == 'multiplayer':
+            self.manager.current = 'mp_setup'
+        elif mode == 'vs_ai':
+            self.manager.current = 'ai_setup'
+        else:
+            screen = self.manager.get_screen('game')
+            screen.setup_game(mode)
+            self.manager.current = 'game'
+
+
+# ─────────────────────────────────────────────
+
+class LeaderboardScreen(Screen):
+    def on_enter(self):
+        self._build()
+
+    def _build(self):
+        self.clear_widgets()
+        _make_bg(self, BG_COLOR)
+
+        layout = BoxLayout(orientation='vertical', padding=dp(14), spacing=dp(8))
+
+        layout.add_widget(Label(text="🏆 Leaderboard", font_size=sp(24),
+                                 bold=True, color=HIGHLIGHT,
+                                 size_hint_y=None, height=dp(44)))
+
+        # Filter row
+        frow = BoxLayout(size_hint_y=None, height=dp(38), spacing=dp(6))
+        frow.add_widget(Label(text="Mode:", color=TEXT_COLOR,
+                               font_size=sp(12), size_hint_x=0.28))
+        self.mode_spinner = Spinner(
+            text="All",
+            values=["All", "classic", "time_attack", "accuracy",
+                    "hard", "endless", "vs_ai", "multiplayer"],
+            size_hint_x=0.72, font_size=sp(12))
+        self.mode_spinner.bind(text=lambda *_: self._refresh())
+        frow.add_widget(self.mode_spinner)
+        layout.add_widget(frow)
+
+        # Header
+        layout.add_widget(Label(
+            text="   Name           Score    WPM    Acc%   Date",
+            color=HIGHLIGHT, font_size=sp(10), size_hint_y=None, height=dp(20),
+            halign='left', text_size=(Window.width - dp(28), None)))
+
+        # Entries list
+        self.entries_layout = BoxLayout(orientation='vertical', spacing=dp(3),
+                                         size_hint_y=None)
+        self.entries_layout.bind(minimum_height=self.entries_layout.setter('height'))
+        layout.add_widget(_scrolled(self.entries_layout))
+
+        back = StyledButton(text="← Back")
+        back.background_color = ACCENT_COLOR
+        back.bind(on_release=lambda *_: setattr(self.manager, 'current', 'menu'))
+        layout.add_widget(back)
+
+        self.add_widget(layout)
+        self._refresh()
+
+    def _refresh(self):
+        self.entries_layout.clear_widgets()
+        mode    = self.mode_spinner.text if self.mode_spinner.text != "All" else None
+        entries = get_top(mode, 10)
+        if not entries:
+            self.entries_layout.add_widget(
+                Label(text="No entries yet — play a race!",
+                       color=TEXT_COLOR, font_size=sp(13),
+                       size_hint_y=None, height=dp(32)))
+            return
+
+        medals = ["🥇", "🥈", "🥉"]
+        for i, e in enumerate(entries):
+            prefix = medals[i] if i < 3 else f"#{i + 1}"
+            line = (f"{prefix} {e['name'][:11]:11s}  "
+                    f"{e['score']:>5.0f}  {e['wpm']:>5.1f}  "
+                    f"{e['accuracy']:>5.1f}%  {e.get('date', '')[:10]}")
+            self.entries_layout.add_widget(Label(
+                text=line, color=TEXT_COLOR, font_size=sp(10),
+                size_hint_y=None, height=dp(22),
+                halign='left', text_size=(Window.width - dp(28), None)))
+
+
+# ─────────────────────────────────────────────
+# App builder
+# ─────────────────────────────────────────────
+
+def build_app():
+    sm = ScreenManager(transition=SlideTransition())
+    sm.add_widget(MenuScreen(name="menu"))
+    sm.add_widget(AISetupScreen(name="ai_setup"))
+    sm.add_widget(MPSetupScreen(name="mp_setup"))
+    sm.add_widget(GameScreen(name="game"))
+    sm.add_widget(MPGameScreen(name="mp_game"))
+    sm.add_widget(ResultsScreen(name="results"))
+    sm.add_widget(LeaderboardScreen(name="leaderboard"))
+    return sm
